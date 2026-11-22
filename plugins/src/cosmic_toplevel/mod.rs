@@ -37,8 +37,14 @@ pub async fn main() {
     let mut requests = json_input_stream(async_stdin());
     let mut next_request = requests.next();
     let mut next_event = toplevel_rx.next();
+    let mut waiting_for_activation = false;
     loop {
-        let event = select(next_request, next_event).await;
+        // A subsequent search must see the compositor's response to the preceding activation.
+        let event = if waiting_for_activation {
+            Either::Right((next_event.await, next_request))
+        } else {
+            select(next_request, next_event).await
+        };
         match event {
             Either::Left((Some(request), second_to_next_event)) => {
                 next_event = second_to_next_event;
@@ -47,7 +53,7 @@ pub async fn main() {
                     Ok(request) => match request {
                         Request::Activate(id) => {
                             debug!("activating {id}");
-                            app.activate(id);
+                            waiting_for_activation = app.activate(id);
                         }
                         Request::Quit(id) => app.quit(id),
                         Request::Search(query) => {
@@ -70,6 +76,7 @@ pub async fn main() {
 
                 for update in updates {
                     match update {
+                        ToplevelUpdate::ActivationProcessed => waiting_for_activation = false,
                         ToplevelUpdate::Info(info) => {
                             if let Some(pos) = app
                                 .toplevels
@@ -142,10 +149,10 @@ impl<W: AsyncWrite + Unpin> App<W> {
         )
     }
 
-    fn activate(&mut self, id: u32) {
+    fn activate(&mut self, id: u32) -> bool {
         info!("requested to activate: {id}");
         if self.ids_to_ignore.contains(&id) {
-            return;
+            return false;
         }
         if let Some(handle) = self.toplevels.iter().find_map(|t| {
             if t.foreign_toplevel.id().protocol_id() == id {
@@ -155,8 +162,12 @@ impl<W: AsyncWrite + Unpin> App<W> {
             }
         }) {
             info!("activating: {id}");
-            let _res = self.calloop_tx.send(ToplevelAction::Activate(handle));
+            return self
+                .calloop_tx
+                .send(ToplevelAction::Activate(handle))
+                .is_ok();
         }
+        false
     }
 
     fn quit(&mut self, id: u32) {

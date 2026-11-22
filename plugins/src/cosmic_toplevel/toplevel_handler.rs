@@ -4,7 +4,7 @@ use cctk::{
     cosmic_protocols,
     toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
-    wayland_client::{self, WEnum},
+    wayland_client::{self, Dispatch, WEnum, protocol::wl_callback},
     wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
 };
 use sctk::{
@@ -31,6 +31,7 @@ pub enum ToplevelAction {
 }
 
 pub enum ToplevelUpdate {
+    ActivationProcessed,
     Info(ToplevelInfo),
     Remove(ExtForeignToplevelHandleV1),
 }
@@ -91,6 +92,21 @@ impl SeatHandler for AppData {
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for AppData {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let _ = state
+            .tx
+            .unbounded_send(vec![ToplevelUpdate::ActivationProcessed]);
+    }
 }
 
 impl ToplevelManagerHandler for AppData {
@@ -163,33 +179,38 @@ pub(crate) fn toplevel_handler(
     let (globals, event_queue) = registry_queue_init(&conn)?;
     let mut event_loop = calloop::EventLoop::<AppData>::try_new()?;
     let qh = event_queue.handle();
+    let display = conn.display();
     let wayland_source = WaylandSource::new(conn, event_queue);
     let handle = event_loop.handle();
 
     handle.insert_source(wayland_source, |_, q, state| q.dispatch_pending(state))?;
 
-    let _ = handle.insert_source(rx, |event, _, state| match event {
-        calloop::channel::Event::Msg(req) => match req {
-            ToplevelAction::Activate(handle) => {
-                let manager = &state.toplevel_manager_state.manager;
-                // TODO Ashley how to choose the seat in a multi-seat setup?
-                if let Some(cosmic_toplevel) = state.cosmic_toplevel_for_foreign(&handle) {
-                    for s in state.seat_state.seats() {
-                        manager.activate(cosmic_toplevel, &s);
+    let activation_queue = qh.clone();
+    handle
+        .insert_source(rx, move |event, _, state| match event {
+            calloop::channel::Event::Msg(req) => match req {
+                ToplevelAction::Activate(handle) => {
+                    let manager = &state.toplevel_manager_state.manager;
+                    // TODO Ashley how to choose the seat in a multi-seat setup?
+                    if let Some(cosmic_toplevel) = state.cosmic_toplevel_for_foreign(&handle) {
+                        for s in state.seat_state.seats() {
+                            manager.activate(cosmic_toplevel, &s);
+                        }
+                    }
+                    display.sync(&activation_queue, ());
+                }
+                ToplevelAction::Close(handle) => {
+                    let manager = &state.toplevel_manager_state.manager;
+                    if let Some(cosmic_toplevel) = state.cosmic_toplevel_for_foreign(&handle) {
+                        manager.close(cosmic_toplevel);
                     }
                 }
+            },
+            calloop::channel::Event::Closed => {
+                state.exit = true;
             }
-            ToplevelAction::Close(handle) => {
-                let manager = &state.toplevel_manager_state.manager;
-                if let Some(cosmic_toplevel) = state.cosmic_toplevel_for_foreign(&handle) {
-                    manager.close(cosmic_toplevel);
-                }
-            }
-        },
-        calloop::channel::Event::Closed => {
-            state.exit = true;
-        }
-    });
+        })
+        .map_err(|e| e.error)?;
 
     let registry_state = RegistryState::new(&globals);
     let mut app_data = AppData {
